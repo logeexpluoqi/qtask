@@ -140,13 +140,13 @@ void qtask_exec(QTaskScheduler *sched)
     void *args;
     QTASK_LIST_ITERATOR(node, &sched->sched_list) {
         task = QTASK_LIST_ENTRY(node, QTaskObj, task_node);
-        sched->run_task = task;
-        if((sched->targetid == task->id) || (sched->targetid == 0)) {
-            args = sched->args;
-        } else {
-            args = QTASK_NONE;
-        }
         if(task->isready) {
+            sched->run_task = task;
+            if((sched->targetid == task->id) || (sched->targetid == 0)) {
+                args = sched->args;
+            } else {
+                args = QTASK_NONE;
+            }
             task->handle(args);
             task->isready = 0;
             task->rtime = task->rtick;
