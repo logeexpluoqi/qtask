@@ -1,6 +1,6 @@
 /*
- * @Author: luoqi 
- * @Date: 2021-04-29 19:27:49 
+ * @Author: luoqi
+ * @Date: 2021-04-29 19:27:49
  * @ Modified by: luoqi
  * @ Modified time: 2025-07-08 00:31
  */
@@ -9,189 +9,188 @@
 #define _QTASK_H
 
 #ifdef __cplusplus
- extern "C" {
+extern "C" {
 #endif
 
 #include <stdint.h>
 #include <stddef.h>
 
-#ifndef QNULL
-#define QNULL ((void *)0)
+/* ==========================================================================
+ * Configuration
+ * ========================================================================== */
+
+/**
+ * @brief Enable per-task execution time measurement, recorded by qtask_exec().
+ *
+ * Costs 4 extra bytes per task and 4 per scheduler. The result is the time a
+ * handler took, in QTASK_NOW() units.
+ */
+#ifndef QTASK_USE_EXEC_TIME
+#define QTASK_USE_EXEC_TIME 0
 #endif
 
 /**
- * @struct QTaskList
- * @brief Represents a node in a doubly linked list.
- * 
- * This structure is used to implement a doubly linked list for task scheduling.
+ * @brief Time source used when QTASK_USE_EXEC_TIME is enabled.
+ *
+ * Defaults to the scheduler tick counter, so the resolution is one tick.
+ * A project may override it, e.g. with a free-running hardware counter, for
+ * finer resolution; it must only count up and may wrap around.
  */
+#ifndef QTASK_NOW
+#define QTASK_NOW(core) ((core)->tick_cnt)
+#endif
+
+/**
+ * @brief Optional critical section hooks around every list modification.
+ *
+ * Only needed when qtask_tick_increase() runs in an interrupt while tasks are
+ * added or removed in thread context. Both default to no-ops, so the library
+ * stays platform independent; a project may define them at build time.
+ *
+ *   QTASK_LOCK()      save and disable interrupts, returns the saved state
+ *   QTASK_UNLOCK(key) restore the state returned by QTASK_LOCK()
+ */
+#ifndef QTASK_LOCK
+#define QTASK_LOCK() ((uint32_t)0)
+#endif
+
+#ifndef QTASK_UNLOCK
+#define QTASK_UNLOCK(key) ((void)(key))
+#endif
+
+/* ==========================================================================
+ * Types
+ * ========================================================================== */
+
+/** @brief Node of the scheduler's doubly linked lists. */
 typedef struct _task_list {
-    struct _task_list* prev; /**< Pointer to the previous node in the list. */
-    struct _task_list* next; /**< Pointer to the next node in the list. */
+    struct _task_list *prev; /**< Previous node. */
+    struct _task_list *next; /**< Next node. */
 } QTaskList;
 
-/**
- * @struct QTaskObj
- * @brief Represents a task object.
- * 
- * This structure encapsulates all the information related to a task, including its name, ID,
- * execution function, timing information, and usage description.
- */
-typedef struct _qtask
-{
-    const char* name;       /**< Name of the task. */
-    uint16_t id;            /**< Unique identifier of the task */
-    uint8_t isready;        /**< Flag indicating whether the task is ready to execute. */
-    void (*handle)(void); /**< Function pointer to the task's execution function. */
-    size_t timer;         /**< Timer value for the task, counting down to execution. */
-    size_t period;          /**< Periodic tick value for the task. */
-    size_t rtime;         /**< Recorded execution time of the task. */
-    size_t rtick;         /**< Running tick count of the task. */
-    QTaskList task_node;    /**< Doubly linked list node for task scheduling. */
-} QTaskObj;
-
-/**
- * @typedef QTaskHandle
- * @brief Function pointer type for task execution functions.
- * 
- * Task execution functions should accept a void pointer as an argument.
- */
+/** @brief Task entry point. */
 typedef void (*QTaskHandle)(void);
 
-/**
- * @struct QTaskSched
- * @brief Represents a task scheduler.
- * 
- * This structure manages the scheduling of tasks, including task arguments, target task ID,
- * the currently running task, and two doubly linked lists for scheduled and unscheduled tasks.
- */
-typedef struct
-{
-    void *args;             /**< Arguments to be passed to the task. */
-    QTaskObj *run_task;     /**< Pointer to the currently running task. */
-    QTaskList task_list;   /**< Doubly linked list for scheduled tasks. */
-    QTaskList suspend_list; /**< Doubly linked list for unscheduled tasks. */
-} QTaskSched;
+/** @brief One task. The storage is owned by the caller (static or pool). */
+typedef struct _qtask {
+    const char *name;    /**< Unique name inside one scheduler. */
+    uint8_t ready;       /**< Set when expired, cleared before the handler runs. */
+    QTaskHandle handle;  /**< Executed when the countdown reaches zero. */
+    size_t timer;        /**< Countdown in ticks until the next run. */
+    size_t period;       /**< Countdown reload value, never 0. */
+#if QTASK_USE_EXEC_TIME
+    size_t exec_time;    /**< Duration of the last run, in QTASK_NOW() units. */
+#endif
+    QTaskList task_node; /**< Node in the scheduled or suspended list. */
+} QTaskObj;
+
+/** @brief Scheduler core. It owns the two lists, not the task objects. */
+typedef struct {
+    QTaskObj *run_task;     /**< Task inside its handler, NULL otherwise. */
+    QTaskList task_list;    /**< Scheduled tasks. */
+    QTaskList suspend_list; /**< Suspended tasks. */
+#if QTASK_USE_EXEC_TIME
+    size_t tick_cnt;        /**< Tick counter, default time base of exec_time. */
+#endif
+} QTaskCore;
+
+/* ==========================================================================
+ * API
+ * ========================================================================== */
 
 /**
- * @brief Initializes the task scheduler.
- * 
- * This function initializes the scheduled and unscheduled task lists of the task scheduler.
- * 
- * @param sched Pointer to the task scheduler object.
+ * @brief  Initializes the scheduler and both task lists.
+ * @param  core  Scheduler core.
  */
-void qtask_sched_init(QTaskSched *sched);
+void qtask_init(QTaskCore *core);
 
 /**
- * @brief Adds a task to the task scheduler.
- * 
- * This function initializes a task object and adds it to the scheduled task list if it's not already there.
- * If the task exists in the unscheduled list, it will be removed first.
- * 
- * @param sched Pointer to the task scheduler object.
- * @param task Pointer to the task object to be added.
- * @param name Name of the task.
- * @param handle Function pointer to the task's execution function.
- * @param tick Periodic tick value for the task.
- * @return 0 if the task is successfully added, 1 if the task already exists in the scheduled list.
+ * @brief  Adds a task, or re-configures the same object if it is suspended.
+ * @param  core    Scheduler core.
+ * @param  task    Task storage, owned by the caller.
+ * @param  name    Unique name inside the core.
+ * @param  handle  Function executed when the task becomes ready.
+ * @param  tick    Period in ticks, 0 is treated as 1.
+ * @return 0 on success, 1 if this object is already scheduled (left untouched),
+ *         -1 on invalid arguments or when the name belongs to another task.
  */
-int qtask_add(QTaskSched *sched, QTaskObj* task, const char* name, QTaskHandle handle, size_t tick);
+int qtask_add(QTaskCore *core, QTaskObj *task, const char *name, QTaskHandle handle, size_t tick);
 
 /**
- * @brief Removes a task from the task scheduler.
- * 
- * This function removes the task from the scheduled list if it exists and adds it to the unscheduled list.
- * 
- * @param sched Pointer to the task scheduler object.
- * @param task Pointer to the task object to be removed.
- * @return 0 if the task is successfully removed and added to the unscheduled list, -1 otherwise.
+ * @brief  Unschedules a task by moving it to the suspended list.
+ * @param  core  Scheduler core.
+ * @param  task  Task to unschedule.
+ * @return 0 on success, -1 if the task is not scheduled.
  */
-int qtask_del(QTaskSched *sched, QTaskObj* task);
+int qtask_del(QTaskCore *core, QTaskObj *task);
 
 /**
- * @brief Schedules a task for execution.
- * 
- * This function adds the task to the scheduled list if it is not already scheduled.
- * 
- * @param sched Pointer to the task scheduler object.
- * @param task Pointer to the task object to be scheduled.
- * @return 0 if the task is successfully added to the scheduled list, -1 otherwise.
+ * @brief  Unlinks a task from both lists so its storage may be freed.
+ *         The object itself is not freed.
+ * @param  core  Scheduler core.
+ * @param  task  Task to unlink, scheduled or suspended.
+ * @return 0 on success, -1 if the task was not linked.
  */
-int qtask_suspend(QTaskSched *sched, const char *name);
+int qtask_remove(QTaskCore *core, QTaskObj *task);
 
 /**
- * @brief Resumes a suspended task.
- * 
- * This function resumes the specified task by removing it from the suspended list.
- * 
- * @param sched Pointer to the task scheduler object.
- * @param task Pointer to the task object to be resumed.
- * @return 0 if the task is successfully resumed, -1 otherwise.
+ * @brief  Suspends a scheduled task by name.
+ * @param  core  Scheduler core.
+ * @param  name  Task name.
+ * @return 0 on success, -1 if no scheduled task has that name.
  */
-int qtask_resume(QTaskSched *sched, const char *name);
+int qtask_suspend(QTaskCore *core, const char *name);
 
 /**
- * @brief Executes all ready tasks in the task scheduler.
- * 
- * This function iterates through the scheduled task list and executes all tasks marked as ready.
- * 
- * @param sched Pointer to the task scheduler object.
+ * @brief  Resumes a suspended task by name, restarting its countdown.
+ * @param  core  Scheduler core.
+ * @param  name  Task name.
+ * @return 0 on success, -1 if no suspended task has that name.
  */
-void qtask_exec(QTaskSched *sched);
+int qtask_resume(QTaskCore *core, const char *name);
 
 /**
- * @brief Retrieves a task object by its name.
- * 
- * This function searches the scheduled task list for a task with the specified name.
- * 
- * @param sched Pointer to the task scheduler object.
- * @param taskname Name of the task to retrieve.
- * @return Pointer to the task object if found, QTASK_NONE otherwise.
+ * @brief  Runs every ready task once and records its execution time.
+ *
+ * Handlers may add, delete, suspend or resume tasks: the list is re-scanned
+ * whenever a node that was not visited yet gets unlinked.
+ *
+ * @param  core  Scheduler core.
  */
-QTaskObj *qtask_obj(QTaskSched *sched, const char *taskname);
+void qtask_exec(QTaskCore *core);
 
 /**
- * @brief Increases the timer count of all tasks in the task scheduler.
- * 
- * This function should be called periodically to update the timer values of all tasks.
- * When a task's timer reaches zero, it will be marked as ready for execution.
- * 
- * @param sched Pointer to the task scheduler object.
+ * @brief  Finds a task by name: scheduled list first, then suspended list.
+ * @param  core      Scheduler core.
+ * @param  taskname  Task name.
+ * @return The task, or NULL if no task has that name.
  */
-void qtask_tick_increase(QTaskSched *sched);
+QTaskObj *qtask_obj(QTaskCore *core, const char *taskname);
 
 /**
- * @brief Measures the execution time of tasks.
- * 
- * This function should be called in a timer interrupt function with a higher frequency than
- * qtask_tick_increase to measure the execution time of task callback functions.
- * 
- * @param sched Pointer to the task scheduler object.
+ * @brief  Advances every countdown by one tick and marks expired tasks ready.
+ * @note   Call from a periodic interrupt, e.g. SysTick.
+ * @param  core  Scheduler core.
  */
-void qtask_runtime_increase(QTaskSched *sched);
+void qtask_tick_increase(QTaskCore *core);
 
 /**
- * @brief Changes the periodic time of a running task.
- * 
- * This function changes the timer value of the currently running task.
- * 
- * @param sched Pointer to the task scheduler object.
- * @param tick New periodic tick value for the task.
+ * @brief  Reloads the countdown of the task currently executing, once.
+ * @note   Must be called from inside a task handler; the period is unchanged.
+ * @param  core  Scheduler core.
+ * @param  tick  New countdown, 0 is treated as 1.
  */
-void qtask_sleep(QTaskSched *sched, size_t tick);
+void qtask_sleep(QTaskCore *core, size_t tick);
 
 /**
- * @brief Changes the periodic time of a task.
- * 
- * This function changes the periodic tick value of a specified task.
- * 
- * @param task Pointer to the task object.
- * @param tick New periodic tick value for the task.
+ * @brief  Changes a task period, effective from its next countdown reload.
+ * @param  task  Task.
+ * @param  tick  New period, 0 is treated as 1.
  */
 void qtask_tick_set(QTaskObj *task, size_t tick);
 
 #ifdef __cplusplus
- }
+}
 #endif
 
 #endif
