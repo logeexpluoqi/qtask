@@ -60,7 +60,7 @@ static QTaskObj *list_find_(QTaskList *list, const char *name)
 
     QTASK_ITERATOR(node, list)
     {
-        task = QTASK_ENTRY(node, QTaskObj, task_node);
+        task = QTASK_ENTRY(node, QTaskObj, node);
         if(name_eq_(task->name, name)) {
             return task;
         }
@@ -68,16 +68,25 @@ static QTaskObj *list_find_(QTaskList *list, const char *name)
     return NULL;
 }
 
+/* Moves a linked task to the given list and restarts its countdown. */
+static inline void task_move_(QTaskObj *task, QTaskList *dst)
+{
+    task->ready = 0;
+    task->countdown = task->reload;
+    list_remove_(&task->node);
+    list_insert_(dst, &task->node);
+}
+
 void qtask_init(QTaskCore *core)
 {
     if(!core) {
         return;
     }
-    core->run_task = NULL;
-    core->task_list.prev = core->task_list.next = &core->task_list;
+    core->current_task = NULL;
+    core->sched_list.prev = core->sched_list.next = &core->sched_list;
     core->suspend_list.prev = core->suspend_list.next = &core->suspend_list;
-#if QTASK_USE_EXEC_TIME
-    core->tick_cnt = 0;
+#if QTASK_EXEC_TIME_ENABLE
+    core->tick_count = 0;
 #endif
 }
 
@@ -93,13 +102,13 @@ int qtask_add(QTaskCore *core, QTaskObj *task, const char *name, QTaskHandle han
 
     key = QTASK_LOCK();
 
-    if(list_contains_(&core->task_list, &task->task_node)) {
+    if(list_contains_(&core->sched_list, &task->node)) {
         ret = 1; /* this very task object is already scheduled, keep it as is */
         goto out;
     }
 
     /* a name is owned by at most one task object, never replace silently */
-    other = list_find_(&core->task_list, name);
+    other = list_find_(&core->sched_list, name);
     if(other == NULL) {
         other = list_find_(&core->suspend_list, name);
     }
@@ -108,45 +117,23 @@ int qtask_add(QTaskCore *core, QTaskObj *task, const char *name, QTaskHandle han
         goto out;
     }
 
-    if(list_contains_(&core->suspend_list, &task->task_node)) {
-        list_remove_(&task->task_node); /* re-registering a suspended task object */
+    if(list_contains_(&core->suspend_list, &task->node)) {
+        list_remove_(&task->node); /* re-registering a suspended task object */
     }
 
     task->name = name;
     task->ready = 0;
-    task->handle = handle;
-    task->timer = tick ? tick : 1;
-    task->period = tick ? tick : 1;
-#if QTASK_USE_EXEC_TIME
+    task->handler = handle;
+    task->countdown = tick ? tick : 1;
+    task->reload = tick ? tick : 1;
+#if QTASK_EXEC_TIME_ENABLE
     task->exec_time = 0;
 #endif
 
-    list_insert_(&core->task_list, &task->task_node);
+    list_insert_(&core->sched_list, &task->node);
 out:
     QTASK_UNLOCK(key);
     return ret;
-}
-
-int qtask_del(QTaskCore *core, QTaskObj *task)
-{
-    uint32_t key;
-
-    if(!core || !task) {
-        return -1;
-    }
-
-    key = QTASK_LOCK();
-    if(!list_contains_(&core->task_list, &task->task_node)) {
-        QTASK_UNLOCK(key);
-        return -1;
-    }
-
-    task->ready = 0;
-    task->timer = task->period;
-    list_remove_(&task->task_node);
-    list_insert_(&core->suspend_list, &task->task_node);
-    QTASK_UNLOCK(key);
-    return 0;
 }
 
 int qtask_remove(QTaskCore *core, QTaskObj *task)
@@ -159,10 +146,10 @@ int qtask_remove(QTaskCore *core, QTaskObj *task)
     }
 
     key = QTASK_LOCK();
-    if(list_contains_(&core->task_list, &task->task_node) ||
-       list_contains_(&core->suspend_list, &task->task_node)) {
+    if(list_contains_(&core->sched_list, &task->node) ||
+       list_contains_(&core->suspend_list, &task->node)) {
         task->ready = 0;
-        list_remove_(&task->task_node);
+        list_remove_(&task->node);
         ret = 0;
     }
     QTASK_UNLOCK(key);
@@ -180,12 +167,9 @@ int qtask_suspend(QTaskCore *core, const char *name)
     }
 
     key = QTASK_LOCK();
-    task = list_find_(&core->task_list, name);
+    task = list_find_(&core->sched_list, name);
     if(task) {
-        task->ready = 0;
-        task->timer = task->period;
-        list_remove_(&task->task_node);
-        list_insert_(&core->suspend_list, &task->task_node);
+        task_move_(task, &core->suspend_list);
         ret = 0;
     }
     QTASK_UNLOCK(key);
@@ -205,10 +189,7 @@ int qtask_resume(QTaskCore *core, const char *name)
     key = QTASK_LOCK();
     task = list_find_(&core->suspend_list, name);
     if(task) {
-        task->ready = 0;
-        task->timer = task->period;
-        list_remove_(&task->task_node);
-        list_insert_(&core->task_list, &task->task_node);
+        task_move_(task, &core->sched_list);
         ret = 0;
     }
     QTASK_UNLOCK(key);
@@ -223,7 +204,7 @@ QTaskObj *qtask_obj(QTaskCore *core, const char *taskname)
         return NULL;
     }
 
-    task = list_find_(&core->task_list, taskname);
+    task = list_find_(&core->sched_list, taskname);
     if(task == NULL) {
         task = list_find_(&core->suspend_list, taskname);
     }
@@ -235,7 +216,7 @@ void qtask_exec(QTaskCore *core)
     QTaskList *node;
     QTaskObj *task;
     QTaskObj *prev;
-#if QTASK_USE_EXEC_TIME
+#if QTASK_EXEC_TIME_ENABLE
     size_t start;
 #endif
 
@@ -243,31 +224,31 @@ void qtask_exec(QTaskCore *core)
         return;
     }
 
-    prev = core->run_task;
-    node = core->task_list.next;
-    while(node != &core->task_list) {
+    prev = core->current_task;
+    node = core->sched_list.next;
+    while(node != &core->sched_list) {
         /* A handler unlinked this node (next points to itself): restart the
          * scan, every task already executed is no longer ready. */
         if(node->next == node) {
-            node = core->task_list.next;
+            node = core->sched_list.next;
             continue;
         }
 
-        task = QTASK_ENTRY(node, QTaskObj, task_node);
+        task = QTASK_ENTRY(node, QTaskObj, node);
         if(task->ready) {
-#if QTASK_USE_EXEC_TIME
+#if QTASK_EXEC_TIME_ENABLE
             start = QTASK_NOW(core);
 #endif
             task->ready = 0; /* before the handler: it may unlink the task */
-            core->run_task = task;
-            task->handle();
-#if QTASK_USE_EXEC_TIME
+            core->current_task = task;
+            task->handler();
+#if QTASK_EXEC_TIME_ENABLE
             task->exec_time = QTASK_NOW(core) - start;
 #endif
         }
         node = node->next;
     }
-    core->run_task = prev;
+    core->current_task = prev;
 }
 
 void qtask_tick_increase(QTaskCore *core)
@@ -279,26 +260,26 @@ void qtask_tick_increase(QTaskCore *core)
         return;
     }
 
-#if QTASK_USE_EXEC_TIME
-    core->tick_cnt++;
+#if QTASK_EXEC_TIME_ENABLE
+    core->tick_count++;
 #endif
 
-    QTASK_ITERATOR(node, &core->task_list)
+    QTASK_ITERATOR(node, &core->sched_list)
     {
-        task = QTASK_ENTRY(node, QTaskObj, task_node);
-        if(--task->timer == 0) {
+        task = QTASK_ENTRY(node, QTaskObj, node);
+        if(--task->countdown == 0) {
             task->ready = 1;
-            task->timer = task->period;
+            task->countdown = task->reload;
         }
     }
 }
 
 void qtask_sleep(QTaskCore *core, size_t tick)
 {
-    if(!core || !core->run_task) {
+    if(!core || !core->current_task) {
         return;
     }
-    core->run_task->timer = tick ? tick : 1;
+    core->current_task->countdown = tick ? tick : 1;
 }
 
 void qtask_tick_set(QTaskObj *task, size_t tick)
@@ -306,5 +287,5 @@ void qtask_tick_set(QTaskObj *task, size_t tick)
     if(!task) {
         return;
     }
-    task->period = tick ? tick : 1;
+    task->reload = tick ? tick : 1;
 }
